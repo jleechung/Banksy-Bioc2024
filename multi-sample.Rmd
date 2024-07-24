@@ -1,0 +1,197 @@
+---
+title: "Spatial data integration with BANKSY and Harmony"
+output: BiocStyle::html_document
+vignette: >
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+    collapse = TRUE,
+    comment = "#>",
+    fig.path = "figures/",
+    dpi = 36
+)
+```
+
+Here, we demonstrate how BANKSY can be used with Harmony for integrating 
+multiple spatial omics datasets in the presence of batch effects. We use 
+10x Visium data of the human dorsolateral prefrontal cortex from Maynard et al 
+(2018). The data comprise 12 samples obtained from 3 subjects, with manual 
+annotation of the layers in each sample. 
+
+```{r, eval=TRUE, include=FALSE}
+start.time <- Sys.time()
+```
+
+```{r}
+library(Banksy)
+library(harmony)
+library(Seurat)
+
+library(SummarizedExperiment)
+library(SpatialExperiment)
+library(scater)
+library(scran)
+library(cowplot)
+library(ggplot2)
+library(ggspavis)
+
+library(spatialLIBD)
+library(ExperimentHub)
+
+SEED <- 100
+```
+
+# Loading the data
+
+We fetch the data for all 12 DLPFC samples with the 
+[*spatialLIBD*](https://bioconductor.org/packages/release/data/experiment/html/spatialLIBD.html) 
+package. This might take awhile.
+
+```{r}
+ehub <- ExperimentHub::ExperimentHub()
+spe <- spatialLIBD::fetch_data(type = "spe", eh = ehub)
+```
+
+Trim the *SpatialExperiment* object:
+
+```{r}
+imgData(spe) <- NULL
+assay(spe, "logcounts") <- NULL
+reducedDims(spe) <- NULL
+rowData(spe) <- NULL
+colData(spe) <- DataFrame(
+  sample_id = spe$sample_id,
+  clust_annotation = factor(
+    addNA(spe$layer_guess_reordered_short),
+    exclude = NULL, labels = seq(8)
+  ),
+  in_tissue = spe$in_tissue,
+  row.names = colnames(spe)
+)
+
+spe <- spe[, spe$sample_id %in% c("151507", "151669", "151673")]
+spe <- spe[, spe$clust_annotation %in% 1:7]
+spe$clust_annotation <- droplevels(spe$clust_annotation)
+sample_names <- unique(spe$sample_id)
+invisible(gc())
+```
+
+Stagger the spatial coordinates for each sample:
+
+```{r}
+staggerCoords = function(locs, group, sep=1.25) {
+    locs[,1] = locs[,1] + abs(min(locs[,1]))
+    max_x = max(locs[,1]) * sep
+    n_groups = length(unique(unlist(group)))
+    shift = seq(from = 0, length.out = n_groups, by = max_x)
+    locs[,1] = locs[,1] + rep(shift, table(group))
+    return(locs)
+}
+
+plot(spatialCoords(spe), col = factor(spe$sample_id))
+plot(staggerCoords(spatialCoords(spe), spe$sample_id), col = factor(spe$sample_id))
+
+spatial_coords_raw <- spatialCoords(spe)
+spatialCoords(spe) <- staggerCoords(spatialCoords(spe), spe$sample_id)
+```
+
+# Preprocessing
+
+Find highly variable features and normalize counts. Here we use Seurat, but 
+other methods may also be used (e.g. `scran::getTopHVGs`). 
+
+```{r}
+seu <- as.Seurat(spe, data = NULL)
+seu <- FindVariableFeatures(seu, nfeatures = 2000)
+scale_factor <- median(colSums(assay(spe, "counts")))
+seu <- NormalizeData(seu, scale.factor = scale_factor, normalization.method = "RC")
+aname <- "normcounts"
+assay(spe, aname, withDimnames = FALSE) <- GetAssayData(seu)
+spe <- spe[VariableFeatures(seu),]
+```
+
+# Run BANKSY
+
+Compute BANKSY neighborhood matrices. We use `k_geom=18` corresponding to 
+first and second-order neighbors in 10x Visium.
+
+```{r}
+compute_agf <- TRUE
+k_geom <- 18
+spe <- computeBanksy(
+    spe, assay_name = aname, 
+    compute_agf = compute_agf, k_geom = k_geom
+)
+```
+
+Run PCA on the BANKSY matrix. We run `lambda=0` for a non-spatial comparison.
+
+```{r}
+lambda <- c(0,0.2)
+npcs <- 20
+use_agf <- TRUE
+spe <- runBanksyPCA(
+    spe, use_agf = use_agf, 
+    lambda = lambda, npcs = npcs, seed = SEED
+)
+```
+
+Run Harmony on the non-spatial and BANKSY embeddings.
+
+```{r}
+set.seed(SEED)
+harmony_nonspatial <- RunHarmony(
+    data_mat = reducedDim(spe, "PCA_M1_lam0"),
+    meta_data = colData(spe),
+    vars_use = "sample_id",
+    return_object = FALSE
+)
+
+set.seed(SEED)
+harmony_banksy <- RunHarmony(
+    data_mat = reducedDim(spe, "PCA_M1_lam0.2"),
+    meta_data = colData(spe),
+    vars_use = "sample_id",
+    return_object = FALSE
+)
+
+reducedDim(spe, "harmony_nonspatial") <- harmony_nonspatial
+reducedDim(spe, "harmony_banksy") <- harmony_banksy
+```
+
+# Clustering
+
+Perform Leiden clustering on the embeddings. The resolution is tuned to obtain
+the expected number of ground truth clusters in the annotation.
+
+```{r}
+dimred_names <- reducedDimNames(spe)[!grepl("UMAP", reducedDimNames(spe))]
+for (i in seq(length(dimred_names))) {
+    spe <- clusterBanksy(spe, dimred = dimred_names[i], 
+                         algo = 'kmeans',
+                         kmeans.centers = 7,
+                         seed = SEED)
+}
+spe <- connectClusters(spe, map_to = "clust_annotation")
+```
+
+Compare cluster labels with ARI / NMI:
+
+```{r}
+message("ARI")
+compareClusters(spe, func = 'ARI')[,1]
+message("NMI")
+compareClusters(spe, func = 'NMI')[,1]
+```
+Visualize clusters:
+
+```{r, fig.height=10, fig.width=10}
+spatialCoords(spe) <- spatial_coords_raw
+spatial_plots <- lapply(clusterNames(spe), function(anno) plotSpots(spe, annotate = anno) + theme(legend.position = 'none') + labs(title = anno))
+plot_grid(plotlist = spatial_plots, ncol=1)
+```
+
+
